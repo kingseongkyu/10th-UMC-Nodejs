@@ -1,0 +1,85 @@
+name: deploy-main
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 코드 체크아웃
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # SSH 설정
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "$EC2_SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          cat >> ~/.ssh/config <<END
+          Host target
+            HostName $EC2_HOST
+            Port $EC2_PORT
+            User $EC2_USER
+            IdentityFile ~/.ssh/id_rsa
+            StrictHostKeyChecking no
+          END
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_PORT: ${{ secrets.EC2_PORT }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+
+      # 서버에 코드 복사
+      - name: Copy files to Server
+        run: |
+          ssh target 'sudo mkdir -p /opt/app/umc10th && sudo chown -R ec2-user:ec2-user /opt/app/umc10th'
+          rsync -az --delete \
+            --exclude ".git" \
+            --exclude ".env" \
+            ./ target:/opt/app/umc10th/
+
+      # .env 파일 생성
+      - name: Create environment variables
+        run: |
+          ssh target "cat > /opt/app/umc10th/.env <<'EOF'
+          ${{ secrets.EC2_DOT_ENV }}
+          EOF"
+        env:
+          EC2_DOT_ENV: ${{ secrets.EC2_DOT_ENV }}
+
+      # 의존성 설치
+      - name: Install dependencies
+        run: |
+          ssh target 'cd /opt/app/umc10th && npm ci'
+
+      # systemd 서비스 설정 및 시작
+      - name: Config systemd service
+        run: |
+          cat <<'EOF' | ssh target 'sudo tee /etc/systemd/system/UMC_10th.service > /dev/null'
+          [Unit]
+          Description=UMC_10th
+          After=network.target
+
+          [Service]
+          User=ec2-user
+          WorkingDirectory=/opt/app/umc10th
+          ExecStart=/bin/bash -lc 'source /home/ec2-user/.nvm/nvm.sh && npm run start'
+          Restart=always
+          Environment=NODE_ENV=production
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          ssh target 'sudo systemctl daemon-reload'
+          ssh target 'sudo systemctl enable UMC_10th'
+          ssh target 'sudo systemctl restart UMC_10th'
+
+      # 서비스 상태 확인
+      - name: Check service status
+        run: |
+          ssh target 'sudo systemctl status UMC_10th -l --no-pager'
